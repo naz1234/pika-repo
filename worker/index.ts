@@ -33,6 +33,7 @@ type Repo = {
   icon: string;
   githubUrl: string;
   cloudflareUrl: string;
+  appUrl: string;
   tone: string;
 };
 
@@ -69,26 +70,43 @@ function isHttpUrl(value: string, allowEmpty = false) {
   }
 }
 
-function isRepo(value: unknown): value is Repo {
-  if (!isRecord(value)) return false;
-  return typeof value.id === "string" && value.id.length > 0 && value.id.length <= 100
+function normalizeRepo(value: unknown): Repo | null {
+  if (!isRecord(value)) return null;
+  const valid = typeof value.id === "string" && value.id.length > 0 && value.id.length <= 100
     && typeof value.name === "string" && value.name.trim().length > 0 && value.name.length <= 120
     && typeof value.description === "string" && value.description.length <= 500
     && typeof value.icon === "string" && value.icon.length <= 24
     && typeof value.githubUrl === "string" && value.githubUrl.length <= 500 && isHttpUrl(value.githubUrl)
     && typeof value.cloudflareUrl === "string" && value.cloudflareUrl.length <= 500 && isHttpUrl(value.cloudflareUrl, true)
     && typeof value.tone === "string" && value.tone.length <= 30;
+  if (!valid) return null;
+
+  const appUrl = typeof value.appUrl === "string" ? value.appUrl : value.cloudflareUrl;
+  if (appUrl.length > 500 || !isHttpUrl(appUrl, true)) return null;
+  return {
+    id: value.id,
+    name: value.name,
+    description: value.description,
+    icon: value.icon,
+    githubUrl: value.githubUrl,
+    cloudflareUrl: value.cloudflareUrl,
+    appUrl,
+    tone: value.tone,
+  };
 }
 
-function isRepoCollection(value: unknown): value is RepoCollection {
-  if (!isRecord(value) || !Array.isArray(value.repos)) return false;
-  if (value.repos.length > 200 || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) return false;
+function normalizeRepoCollection(value: unknown): RepoCollection | null {
+  if (!isRecord(value) || !Array.isArray(value.repos)) return null;
+  if (value.repos.length > 200 || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) return null;
   const ids = new Set<string>();
-  for (const repo of value.repos) {
-    if (!isRepo(repo) || ids.has(repo.id)) return false;
+  const repos: Repo[] = [];
+  for (const storedRepo of value.repos) {
+    const repo = normalizeRepo(storedRepo);
+    if (!repo || ids.has(repo.id)) return null;
     ids.add(repo.id);
+    repos.push(repo);
   }
-  return true;
+  return { repos, updatedAt: value.updatedAt };
 }
 
 export class RepoStore {
@@ -96,8 +114,14 @@ export class RepoStore {
 
   async fetch(request: Request): Promise<Response> {
     if (request.method === "GET") {
-      const collection = await this.state.storage.get<RepoCollection>(REPO_STORAGE_KEY);
-      return collection ? json(collection) : json({ error: "No repository data" }, 404);
+      const stored = await this.state.storage.get<unknown>(REPO_STORAGE_KEY);
+      if (!stored) return json({ error: "No repository data" }, 404);
+      const collection = normalizeRepoCollection(stored);
+      if (!collection) return json({ error: "Invalid repository data" }, 500);
+      if (JSON.stringify(stored) !== JSON.stringify(collection)) {
+        await this.state.storage.put(REPO_STORAGE_KEY, collection);
+      }
+      return json(collection);
     }
 
     if (request.method === "PUT") {
@@ -111,9 +135,10 @@ export class RepoStore {
         return json({ error: "Invalid JSON" }, 400);
       }
 
-      if (!isRepoCollection(collection)) return json({ error: "Invalid repository data" }, 400);
-      await this.state.storage.put(REPO_STORAGE_KEY, collection);
-      return json(collection);
+      const normalized = normalizeRepoCollection(collection);
+      if (!normalized) return json({ error: "Invalid repository data" }, 400);
+      await this.state.storage.put(REPO_STORAGE_KEY, normalized);
+      return json(normalized);
     }
 
     return json({ error: "Method not allowed" }, 405, { allow: "GET, PUT" });

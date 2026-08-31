@@ -23,6 +23,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 
 type Tab = "home" | "apps" | "live" | "settings";
+type SyncStatus = "loading" | "saving" | "synced" | "offline";
 
 type Repo = {
   id: string;
@@ -34,7 +35,14 @@ type Repo = {
   tone: string;
 };
 
+type RepoCollection = {
+  repos: Repo[];
+  updatedAt: string;
+};
+
 const STORAGE_KEY = "pika-repo-favourites";
+const SYNC_MIGRATION_KEY = "pika-repo-cloud-sync-v1";
+const SYNC_ENDPOINT = "/api/repos";
 
 const defaultRepos: Repo[] = [
   { id: "pika-flights", name: "Pika Flights", description: "Flight plans, packing checklists and baggage calculator.", icon: "✈️", githubUrl: "https://github.com/naz1234/pika-flights", cloudflareUrl: "", tone: "blue" },
@@ -48,6 +56,50 @@ const defaultRepos: Repo[] = [
 const emptyForm = { name: "", description: "", icon: "⭐", githubUrl: "", cloudflareUrl: "" };
 const toneCycle = ["blue", "mint", "pink", "yellow", "purple", "coral"];
 
+function isRepo(value: unknown): value is Repo {
+  if (!value || typeof value !== "object") return false;
+  const repo = value as Partial<Repo>;
+  return typeof repo.id === "string"
+    && typeof repo.name === "string"
+    && typeof repo.description === "string"
+    && typeof repo.icon === "string"
+    && typeof repo.githubUrl === "string"
+    && typeof repo.cloudflareUrl === "string"
+    && typeof repo.tone === "string";
+}
+
+function isRepoCollection(value: unknown): value is RepoCollection {
+  if (!value || typeof value !== "object") return false;
+  const collection = value as Partial<RepoCollection>;
+  return Array.isArray(collection.repos)
+    && collection.repos.every(isRepo)
+    && typeof collection.updatedAt === "string";
+}
+
+function mergeFirstCloudSync(cloudRepos: Repo[], localRepos: Repo[]) {
+  const merged = new Map(cloudRepos.map((repo) => [repo.id, repo]));
+  for (const localRepo of localRepos) {
+    const cloudRepo = merged.get(localRepo.id);
+    if (!cloudRepo) {
+      merged.set(localRepo.id, localRepo);
+    } else if (localRepo.cloudflareUrl && !cloudRepo.cloudflareUrl) {
+      merged.set(localRepo.id, { ...cloudRepo, cloudflareUrl: localRepo.cloudflareUrl });
+    }
+  }
+  return [...merged.values()];
+}
+
+async function saveToCloud(repos: Repo[], signal?: AbortSignal) {
+  const collection: RepoCollection = { repos, updatedAt: new Date().toISOString() };
+  const response = await fetch(SYNC_ENDPOINT, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(collection),
+    signal,
+  });
+  if (!response.ok) throw new Error(`Sync failed with ${response.status}`);
+}
+
 export default function Home() {
   const [tab, setTab] = useState<Tab>("home");
   const [repos, setRepos] = useState<Repo[]>(defaultRepos);
@@ -55,28 +107,82 @@ export default function Home() {
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(emptyForm);
-  const [ready, setReady] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
+  const [remoteReady, setRemoteReady] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>("loading");
   const [toast, setToast] = useState("");
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      const saved = window.localStorage.getItem(STORAGE_KEY);
-      if (saved) {
+      void (async () => {
+        let localRepos = defaultRepos;
         try {
-          const parsed: unknown = JSON.parse(saved);
-          if (Array.isArray(parsed)) setRepos(parsed as Repo[]);
+          const saved = window.localStorage.getItem(STORAGE_KEY);
+          if (saved) {
+            const parsed: unknown = JSON.parse(saved);
+            if (Array.isArray(parsed) && parsed.every(isRepo)) localRepos = parsed;
+          }
+
+          const response = await fetch(SYNC_ENDPOINT, { cache: "no-store", signal: controller.signal });
+          if (response.ok) {
+            const cloudData: unknown = await response.json();
+            if (!isRepoCollection(cloudData)) throw new Error("Invalid cloud data");
+
+            const firstSync = window.localStorage.getItem(SYNC_MIGRATION_KEY) !== "done";
+            const nextRepos = firstSync ? mergeFirstCloudSync(cloudData.repos, localRepos) : cloudData.repos;
+            setRepos(nextRepos);
+            window.localStorage.setItem(STORAGE_KEY, JSON.stringify(nextRepos));
+            if (firstSync && JSON.stringify(nextRepos) !== JSON.stringify(cloudData.repos)) {
+              await saveToCloud(nextRepos, controller.signal);
+            }
+          } else if (response.status === 404) {
+            setRepos(localRepos);
+            await saveToCloud(localRepos, controller.signal);
+          } else {
+            throw new Error(`Sync failed with ${response.status}`);
+          }
+
+          window.localStorage.setItem(SYNC_MIGRATION_KEY, "done");
+          setRemoteReady(true);
+          setSyncStatus("synced");
         } catch {
-          setRepos(defaultRepos);
+          if (controller.signal.aborted) return;
+          setRepos(localRepos);
+          setSyncStatus("offline");
+          setToast("Cloud sync is unavailable. Changes are saved on this device for now.");
+        } finally {
+          if (!controller.signal.aborted) setHydrated(true);
         }
-      }
-      setReady(true);
+      })();
     }, 0);
-    return () => window.clearTimeout(timer);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, []);
 
   useEffect(() => {
-    if (ready) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(repos));
-  }, [ready, repos]);
+    if (!hydrated) return;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(repos));
+    if (!remoteReady) return;
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setSyncStatus("saving");
+      saveToCloud(repos, controller.signal)
+        .then(() => setSyncStatus("synced"))
+        .catch(() => {
+          if (!controller.signal.aborted) setSyncStatus("offline");
+        });
+    }, 450);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [hydrated, remoteReady, repos]);
 
   useEffect(() => {
     if (!toast) return;
@@ -92,6 +198,13 @@ export default function Home() {
 
   const liveRepos = repos.filter((repo) => Boolean(repo.cloudflareUrl));
   const pendingRepos = repos.filter((repo) => !repo.cloudflareUrl);
+  const syncLabel = syncStatus === "synced"
+    ? "Synced across devices"
+    : syncStatus === "saving"
+      ? "Syncing changes…"
+      : syncStatus === "loading"
+        ? "Loading shared links…"
+        : "Offline — saved on this device";
 
   function changeTab(nextTab: Tab) {
     setTab(nextTab);
@@ -133,20 +246,20 @@ export default function Home() {
     setRepos((current) => editingId
       ? current.map((repo) => (repo.id === editingId ? nextRepo : repo))
       : [nextRepo, ...current]);
-    setToast(editingId ? "Favourite updated." : "Favourite added.");
+    setToast(editingId ? "Favourite updated and syncing." : "Favourite added and syncing.");
     closeForm();
   }
 
   function removeRepo(repo: Repo) {
     if (!window.confirm(`Remove ${repo.name} from your favourites?`)) return;
     setRepos((current) => current.filter((item) => item.id !== repo.id));
-    setToast("Favourite removed.");
+    setToast("Favourite removed and syncing.");
   }
 
   function resetRepos() {
     if (!window.confirm("Restore the original Pika favourites?")) return;
     setRepos(defaultRepos);
-    setToast("Original favourites restored.");
+    setToast("Original favourites restored and syncing.");
   }
 
   function RepoCard({ repo, compact = false }: { repo: Repo; compact?: boolean }) {
@@ -211,7 +324,7 @@ export default function Home() {
 
             <div className="public-note">
               <ShieldCheck size={22} />
-              <span><strong>Public and simple</strong><small>No login is needed. Your edits stay on this device.</small></span>
+              <span><strong>{syncLabel}</strong><small>No login is needed. Links are shared through the app&apos;s cloud storage.</small></span>
             </div>
           </section>
         )}
@@ -277,14 +390,14 @@ export default function Home() {
 
         {tab === "settings" && (
           <section className="page-section">
-            <div className="page-title"><p className="eyebrow">About & data</p><h2>Settings</h2><p>Manage this public collection on your device.</p></div>
+            <div className="page-title"><p className="eyebrow">About & data</p><h2>Settings</h2><p>Manage this public collection across your devices.</p></div>
             <p className="group-label">App access</p>
             <div className="settings-card">
               <div className="setting-row"><span className="setting-icon green"><ShieldCheck size={19} /></span><span><strong>No login</strong><small>Anyone with the link can open the app</small></span><Check size={18} /></div>
               <div className="setting-row"><span className="setting-icon blue"><GitBranch size={19} /></span><span><strong>GitHub projects</strong><small>{repos.length} repository links saved</small></span><Check size={18} /></div>
               <div className="setting-row"><span className="setting-icon pink"><Cloud size={19} /></span><span><strong>Cloudflare apps</strong><small>{liveRepos.length} live links connected</small></span><Check size={18} /></div>
             </div>
-            <div className="public-note settings-note"><ShieldCheck size={22} /><span><strong>Saved on this device</strong><small>Changes use browser storage and do not need an account.</small></span></div>
+            <div className="public-note settings-note"><ShieldCheck size={22} /><span><strong>{syncLabel}</strong><small>Cloudflare links and favourites use shared cloud storage, with a local backup on this device.</small></span></div>
             <button className="danger-button" type="button" onClick={resetRepos}><RotateCcw size={17} /> Restore original favourites</button>
           </section>
         )}

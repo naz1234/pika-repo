@@ -32,6 +32,7 @@ type Repo = {
   icon: string;
   githubUrl: string;
   cloudflareUrl: string;
+  appUrl: string;
   tone: string;
 };
 
@@ -45,35 +46,52 @@ const SYNC_MIGRATION_KEY = "pika-repo-cloud-sync-v1";
 const SYNC_ENDPOINT = "/api/repos";
 
 const defaultRepos: Repo[] = [
-  { id: "pika-flights", name: "Pika Flights", description: "Flight plans, packing checklists and baggage calculator.", icon: "✈️", githubUrl: "https://github.com/naz1234/pika-flights", cloudflareUrl: "", tone: "blue" },
-  { id: "pika-car-maint", name: "Pika Car Maint", description: "A simple home for car maintenance records and checklists.", icon: "🚙", githubUrl: "https://github.com/naz1234/pika-car-Maint", cloudflareUrl: "", tone: "mint" },
-  { id: "pika-places", name: "Pika Places", description: "Save interesting places found on TikTok, Facebook and more.", icon: "📍", githubUrl: "https://github.com/naz1234/pika-places", cloudflareUrl: "", tone: "pink" },
-  { id: "pika-note", name: "Pika Note", description: "Public shared notes in a quick mobile-friendly workspace.", icon: "📝", githubUrl: "https://github.com/naz1234/pika-note", cloudflareUrl: "", tone: "yellow" },
-  { id: "pika-calendar", name: "Pika Calendar", description: "Salary calendar with expected and received pay tracking.", icon: "📅", githubUrl: "https://github.com/naz1234/pika-calendar", cloudflareUrl: "", tone: "purple" },
-  { id: "pika-checklist", name: "Pika Checklist", description: "Everyday lists, organised and easy to check on the go.", icon: "✅", githubUrl: "https://github.com/naz1234/Pika-checklist", cloudflareUrl: "", tone: "coral" },
+  { id: "pika-flights", name: "Pika Flights", description: "Flight plans, packing checklists and baggage calculator.", icon: "✈️", githubUrl: "https://github.com/naz1234/pika-flights", cloudflareUrl: "", appUrl: "", tone: "blue" },
+  { id: "pika-car-maint", name: "Pika Car Maint", description: "A simple home for car maintenance records and checklists.", icon: "🚙", githubUrl: "https://github.com/naz1234/pika-car-Maint", cloudflareUrl: "", appUrl: "", tone: "mint" },
+  { id: "pika-places", name: "Pika Places", description: "Save interesting places found on TikTok, Facebook and more.", icon: "📍", githubUrl: "https://github.com/naz1234/pika-places", cloudflareUrl: "", appUrl: "", tone: "pink" },
+  { id: "pika-note", name: "Pika Note", description: "Public shared notes in a quick mobile-friendly workspace.", icon: "📝", githubUrl: "https://github.com/naz1234/pika-note", cloudflareUrl: "", appUrl: "", tone: "yellow" },
+  { id: "pika-calendar", name: "Pika Calendar", description: "Salary calendar with expected and received pay tracking.", icon: "📅", githubUrl: "https://github.com/naz1234/pika-calendar", cloudflareUrl: "", appUrl: "", tone: "purple" },
+  { id: "pika-checklist", name: "Pika Checklist", description: "Everyday lists, organised and easy to check on the go.", icon: "✅", githubUrl: "https://github.com/naz1234/Pika-checklist", cloudflareUrl: "", appUrl: "", tone: "coral" },
 ];
 
-const emptyForm = { name: "", description: "", icon: "⭐", githubUrl: "", cloudflareUrl: "" };
+const emptyForm = { name: "", description: "", icon: "⭐", githubUrl: "", cloudflareUrl: "", appUrl: "" };
 const toneCycle = ["blue", "mint", "pink", "yellow", "purple", "coral"];
 
-function isRepo(value: unknown): value is Repo {
-  if (!value || typeof value !== "object") return false;
+function normalizeRepo(value: unknown): Repo | null {
+  if (!value || typeof value !== "object") return null;
   const repo = value as Partial<Repo>;
-  return typeof repo.id === "string"
+  const valid = typeof repo.id === "string"
     && typeof repo.name === "string"
     && typeof repo.description === "string"
     && typeof repo.icon === "string"
     && typeof repo.githubUrl === "string"
     && typeof repo.cloudflareUrl === "string"
     && typeof repo.tone === "string";
+  if (!valid) return null;
+  return {
+    id: repo.id,
+    name: repo.name,
+    description: repo.description,
+    icon: repo.icon,
+    githubUrl: repo.githubUrl,
+    cloudflareUrl: repo.cloudflareUrl,
+    appUrl: typeof repo.appUrl === "string" ? repo.appUrl : repo.cloudflareUrl,
+    tone: repo.tone,
+  };
 }
 
-function isRepoCollection(value: unknown): value is RepoCollection {
-  if (!value || typeof value !== "object") return false;
+function normalizeRepos(value: unknown): Repo[] | null {
+  if (!Array.isArray(value)) return null;
+  const repos = value.map(normalizeRepo);
+  return repos.every((repo): repo is Repo => repo !== null) ? repos : null;
+}
+
+function normalizeRepoCollection(value: unknown): RepoCollection | null {
+  if (!value || typeof value !== "object") return null;
   const collection = value as Partial<RepoCollection>;
-  return Array.isArray(collection.repos)
-    && collection.repos.every(isRepo)
-    && typeof collection.updatedAt === "string";
+  const repos = normalizeRepos(collection.repos);
+  if (!repos || typeof collection.updatedAt !== "string") return null;
+  return { repos, updatedAt: collection.updatedAt };
 }
 
 function mergeFirstCloudSync(cloudRepos: Repo[], localRepos: Repo[]) {
@@ -82,8 +100,12 @@ function mergeFirstCloudSync(cloudRepos: Repo[], localRepos: Repo[]) {
     const cloudRepo = merged.get(localRepo.id);
     if (!cloudRepo) {
       merged.set(localRepo.id, localRepo);
-    } else if (localRepo.cloudflareUrl && !cloudRepo.cloudflareUrl) {
-      merged.set(localRepo.id, { ...cloudRepo, cloudflareUrl: localRepo.cloudflareUrl });
+    } else {
+      merged.set(localRepo.id, {
+        ...cloudRepo,
+        cloudflareUrl: cloudRepo.cloudflareUrl || localRepo.cloudflareUrl,
+        appUrl: cloudRepo.appUrl || localRepo.appUrl,
+      });
     }
   }
   return [...merged.values()];
@@ -125,13 +147,14 @@ export default function Home() {
           const saved = window.localStorage.getItem(STORAGE_KEY);
           if (saved) {
             const parsed: unknown = JSON.parse(saved);
-            if (Array.isArray(parsed) && parsed.every(isRepo)) localRepos = parsed;
+            const normalized = normalizeRepos(parsed);
+            if (normalized) localRepos = normalized;
           }
 
           const response = await fetch(SYNC_ENDPOINT, { cache: "no-store", signal: controller.signal });
           if (response.ok) {
-            const cloudData: unknown = await response.json();
-            if (!isRepoCollection(cloudData)) throw new Error("Invalid cloud data");
+            const cloudData = normalizeRepoCollection(await response.json());
+            if (!cloudData) throw new Error("Invalid cloud data");
 
             const firstSync = window.localStorage.getItem(SYNC_MIGRATION_KEY) !== "done";
             const nextRepos = firstSync ? mergeFirstCloudSync(cloudData.repos, localRepos) : cloudData.repos;
@@ -200,8 +223,8 @@ export default function Home() {
     return repos.filter((repo) => `${repo.name} ${repo.description}`.toLowerCase().includes(value));
   }, [query, repos]);
 
-  const liveRepos = repos.filter((repo) => Boolean(repo.cloudflareUrl));
-  const pendingRepos = repos.filter((repo) => !repo.cloudflareUrl);
+  const liveRepos = repos.filter((repo) => Boolean(repo.appUrl));
+  const pendingRepos = repos.filter((repo) => !repo.appUrl);
   const syncLabel = syncStatus === "synced"
     ? "Synced across devices"
     : syncStatus === "saving"
@@ -223,7 +246,7 @@ export default function Home() {
 
   function openEditForm(repo: Repo) {
     setEditingId(repo.id);
-    setForm({ name: repo.name, description: repo.description, icon: repo.icon, githubUrl: repo.githubUrl, cloudflareUrl: repo.cloudflareUrl });
+    setForm({ name: repo.name, description: repo.description, icon: repo.icon, githubUrl: repo.githubUrl, cloudflareUrl: repo.cloudflareUrl, appUrl: repo.appUrl });
     setFormOpen(true);
   }
 
@@ -242,6 +265,7 @@ export default function Home() {
       icon: form.icon.trim() || "⭐",
       githubUrl: form.githubUrl.trim(),
       cloudflareUrl: form.cloudflareUrl.trim(),
+      appUrl: form.appUrl.trim(),
       tone: editingId
         ? (repos.find((repo) => repo.id === editingId)?.tone ?? "blue")
         : (toneCycle[repos.length % toneCycle.length] ?? "blue"),
@@ -288,10 +312,10 @@ export default function Home() {
         )}
         <div className="repo-links">
           <a href={repo.githubUrl} target="_blank" rel="noreferrer"><GitBranch size={18} /> GitHub <ExternalLink size={14} /></a>
-          {repo.cloudflareUrl ? (
-            <a className="cloudflare-link" href={repo.cloudflareUrl} target="_blank" rel="noreferrer"><Cloud size={18} /> Open app <ExternalLink size={14} /></a>
+          {repo.appUrl ? (
+            <a className="cloudflare-link" href={repo.appUrl} target="_blank" rel="noreferrer"><Cloud size={18} /> Open app <ExternalLink size={14} /></a>
           ) : (
-            <button className="cloudflare-link pending" type="button" onClick={() => openEditForm(repo)}><Cloud size={18} /> Add live link</button>
+            <button className="cloudflare-link pending" type="button" onClick={() => openEditForm(repo)}><Cloud size={18} /> Add app link</button>
           )}
         </div>
       </article>
@@ -365,7 +389,7 @@ export default function Home() {
 
         {tab === "live" && (
           <section className="page-section">
-            <div className="page-title"><p className="eyebrow">Cloudflare</p><h2>Live apps</h2><p>Open deployed apps or add their Cloudflare links.</p></div>
+            <div className="page-title"><p className="eyebrow">App links</p><h2>Live apps</h2><p>Open public app links and keep deployment links separately.</p></div>
 
             <div className="live-summary">
               <span className="summary-icon"><Cloud size={24} /></span>
@@ -376,9 +400,9 @@ export default function Home() {
             {liveRepos.length > 0 && (
               <><p className="group-label">Ready to open</p><div className="link-list">
                 {liveRepos.map((repo) => (
-                  <a href={repo.cloudflareUrl} target="_blank" rel="noreferrer" className="link-list-row" key={repo.id}>
+                  <a href={repo.appUrl} target="_blank" rel="noreferrer" className="link-list-row" key={repo.id}>
                     <span className={`repo-icon tone-${repo.tone}`}>{repo.icon}</span>
-                    <span><strong>{repo.name}</strong><small>{deploymentLabel(repo.cloudflareUrl)}</small></span>
+                    <span><strong>{repo.name}</strong><small>{deploymentLabel(repo.appUrl)}</small></span>
                     <ExternalLink size={18} />
                   </a>
                 ))}
@@ -390,7 +414,7 @@ export default function Home() {
                 {pendingRepos.map((repo) => (
                   <button className="link-list-row" type="button" onClick={() => openEditForm(repo)} key={repo.id}>
                     <span className={`repo-icon tone-${repo.tone}`}>{repo.icon}</span>
-                    <span><strong>{repo.name}</strong><small>Add Cloudflare URL</small></span>
+                    <span><strong>{repo.name}</strong><small>Add public app URL</small></span>
                     <Plus size={18} />
                   </button>
                 ))}
@@ -406,7 +430,7 @@ export default function Home() {
             <div className="settings-card">
               <div className="setting-row"><span className="setting-icon green"><ShieldCheck size={19} /></span><span><strong>No login</strong><small>Anyone with the link can open the app</small></span><Check size={18} /></div>
               <div className="setting-row"><span className="setting-icon blue"><GitBranch size={19} /></span><span><strong>GitHub projects</strong><small>{repos.length} repository links saved</small></span><Check size={18} /></div>
-              <div className="setting-row"><span className="setting-icon pink"><Cloud size={19} /></span><span><strong>Cloudflare apps</strong><small>{liveRepos.length} live links connected</small></span><Check size={18} /></div>
+              <div className="setting-row"><span className="setting-icon pink"><Cloud size={19} /></span><span><strong>Public app links</strong><small>{liveRepos.length} app links connected</small></span><Check size={18} /></div>
             </div>
             <div className="public-note settings-note"><ShieldCheck size={22} /><span><strong>{syncLabel}</strong><small>Cloudflare links and favourites use shared cloud storage, with a local backup on this device.</small></span></div>
             <button className="danger-button" type="button" onClick={resetRepos}><RotateCcw size={17} /> Restore original favourites</button>
@@ -434,7 +458,8 @@ export default function Home() {
             </div>
             <label><span>Short description</span><input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} placeholder="What this app is for" /></label>
             <label><span>GitHub link</span><input required type="url" inputMode="url" value={form.githubUrl} onChange={(event) => setForm({ ...form, githubUrl: event.target.value })} placeholder="https://github.com/..." /></label>
-            <label><span>Cloudflare link</span><input type="url" inputMode="url" value={form.cloudflareUrl} onChange={(event) => setForm({ ...form, cloudflareUrl: event.target.value })} placeholder="https://your-app.pages.dev" /></label>
+            <label><span>Cloudflare deployment link</span><input type="url" inputMode="url" value={form.cloudflareUrl} onChange={(event) => setForm({ ...form, cloudflareUrl: event.target.value })} placeholder="https://your-worker.workers.dev" /></label>
+            <label><span>App link</span><input type="url" inputMode="url" value={form.appUrl} onChange={(event) => setForm({ ...form, appUrl: event.target.value })} placeholder="https://your-public-app.com" /></label>
             <button className="primary-button full tall" type="submit"><Check size={20} /> Save favourite</button>
           </form>
         </div>

@@ -89,6 +89,10 @@ function mergeFirstCloudSync(cloudRepos: Repo[], localRepos: Repo[]) {
   return [...merged.values()];
 }
 
+function deploymentLabel(url: string) {
+  return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
+}
+
 async function saveToCloud(repos: Repo[], signal?: AbortSignal) {
   const collection: RepoCollection = { repos, updatedAt: new Date().toISOString() };
   const response = await fetch(SYNC_ENDPOINT, {
@@ -275,6 +279,13 @@ export default function Home() {
             </span>
           )}
         </div>
+        {repo.cloudflareUrl && (
+          <a className="deployment-url" href={repo.cloudflareUrl} target="_blank" rel="noreferrer" title={repo.cloudflareUrl}>
+            <Cloud size={16} />
+            <span><small>Cloudflare deployment</small><strong>{deploymentLabel(repo.cloudflareUrl)}</strong></span>
+            <ExternalLink size={15} />
+          </a>
+        )}
         <div className="repo-links">
           <a href={repo.githubUrl} target="_blank" rel="noreferrer"><GitBranch size={18} /> GitHub <ExternalLink size={14} /></a>
           {repo.cloudflareUrl ? (
@@ -367,7 +378,7 @@ export default function Home() {
                 {liveRepos.map((repo) => (
                   <a href={repo.cloudflareUrl} target="_blank" rel="noreferrer" className="link-list-row" key={repo.id}>
                     <span className={`repo-icon tone-${repo.tone}`}>{repo.icon}</span>
-                    <span><strong>{repo.name}</strong><small>{repo.cloudflareUrl.replace(/^https?:\/\//, "")}</small></span>
+                    <span><strong>{repo.name}</strong><small>{deploymentLabel(repo.cloudflareUrl)}</small></span>
                     <ExternalLink size={18} />
                   </a>
                 ))}
